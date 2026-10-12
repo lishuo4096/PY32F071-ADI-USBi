@@ -1,0 +1,148 @@
+version: "4.1"
+name: Alternative_ADI_USBI
+type: ARM
+deviceName: PY32F071xB
+packDir: ""
+srcDirs: []
+virtualFolder:
+  name: <virtual_root>
+  files: []
+  folders:
+    - name: Drivers
+      files: []
+      folders:
+        - name: PY32F071_HAL_Driver
+          files:
+            - path: ../Drivers/PY32F071_HAL_Driver/Src/py32f071_hal_rcc.c
+            - path: ../Drivers/PY32F071_HAL_Driver/Src/py32f071_hal_rcc_ex.c
+            - path: ../Drivers/PY32F071_HAL_Driver/Src/py32f071_hal_pwr.c
+            - path: ../Drivers/PY32F071_HAL_Driver/Src/py32f071_hal_exti.c
+            - path: ../Drivers/PY32F071_HAL_Driver/Src/py32f071_hal_gpio.c
+            - path: ../Drivers/PY32F071_HAL_Driver/Src/py32f071_hal_dma.c
+            - path: ../Drivers/PY32F071_HAL_Driver/Src/py32f071_hal_tim.c
+            - path: ../Drivers/PY32F071_HAL_Driver/Src/py32f071_hal_tim_ex.c
+            - path: ../Drivers/PY32F071_HAL_Driver/Src/py32f071_hal_spi.c
+            - path: ../Drivers/PY32F071_HAL_Driver/Src/py32f071_hal_i2c.c
+            - path: ../Drivers/PY32F071_HAL_Driver/Src/py32f071_hal_iwdg.c
+            - path: ../Drivers/PY32F071_HAL_Driver/Src/py32f071_hal.c
+            - path: ../Drivers/PY32F071_HAL_Driver/Src/py32f071_hal_cortex.c
+          folders: []
+    - name: Application
+      files: []
+      folders:
+        - name: User
+          files: []
+          folders:
+            - name: Core
+              files:
+                - path: ../Core/SRC/rcc.c
+                - path: ../Core/SRC/gpio.c
+                - path: ../Core/SRC/dma.c
+                - path: ../Core/SRC/py32f071_it.c
+                - path: ../Core/SRC/tim.c
+                - path: ../Core/SRC/usb.c
+                - path: ../Core/SRC/usbi.c
+                - path: ../Core/SRC/usbi_led.c
+                - path: ../Core/SRC/ws2812.c
+                - path: ../Core/SRC/spi.c
+                - path: ../Core/SRC/i2c.c
+                - path: ../Core/SRC/iwdg.c
+                - path: ../Core/SRC/main.c
+                - path: ../Core/SRC/py32f071_hal_msp.c
+              folders: []
+    - name: Middlewares
+      files: []
+      folders:
+        - name: USB_Device_Library
+          files:
+            - path: ../Middlewares/Third_Party/CherryUSB/core/usbd_core.c
+            - path: ../Middlewares/Third_Party/CherryUSB/port/usb_dc_py32.c
+            - path: ../Middlewares/Third_Party/CherryUSB/class/hid/usbd_hid.c
+          folders: []
+    - name: EIDE
+      files:
+        - path: startup_py32f071.s
+        - path: ../Core/SRC/system_py32f071.c
+      folders: []
+dependenceList: []
+outDir: build
+miscInfo:
+  uid: ""
+targets:
+  Debug:
+    cppPreprocessAttrs:
+      defineList:
+        - PY32F071xB
+        - USE_HAL_DRIVER
+      incList:
+        - ../Core/INC
+        - ../Middlewares/Third_Party/CherryUSB/class
+        - ../Middlewares/Third_Party/CherryUSB/common
+        - ../Middlewares/Third_Party/CherryUSB/core
+        - ../Middlewares/Third_Party/CherryUSB/port
+        - ../Drivers/CMSIS/Include
+        - ../Drivers/PY32F071_HAL_Driver/Inc
+        - ../Drivers/CMSIS/Device/PY32F071/Include
+      libList: []
+    excludeList: []
+    settings:
+      debugger: cortex-debug
+    toolchain: GCC
+    toolchainConfigMap:
+      GCC:
+        archExtensions: ""
+        cpuType: Cortex-M0+
+        floatingPointHardware: none
+        options:
+          version: 5
+          afterBuildTasks: []
+          asm-compiler:
+            ASM_FLAGS: ""
+          beforeBuildTasks: []
+          c/cpp-compiler:
+            CXX_FLAGS: ""
+            C_FLAGS: ""
+            language-c: c11
+            language-cpp: c++11
+            one-elf-section-per-data: true
+            one-elf-section-per-function: true
+            optimization: level-debug
+            warnings: all-warnings
+          global:
+            $float-abi-type: ""
+            arm-thumb-mode: thumb
+            misc-control: --specs=nosys.specs --specs=nano.specs
+            output-debug-info: enable
+          linker:
+            LD_FLAGS: " "
+            LIB_FLAGS: -lm
+            output-format: elf
+            remove-unused-input-sections: true
+        scatterFilePath: PY32F071K1BU6.ld
+        storageLayout:
+          RAM: []
+          ROM: []
+        useCustomScatterFile: true
+    uploadConfigMap:
+      JLink:
+        baseAddr: ""
+        bin: ""
+        cpuInfo:
+          cpuName: PY32F071xB
+          endor: Puya
+        otherCmds: ""
+        proType: 1
+        speed: 1000
+      OpenOCD:
+        baseAddr: "0x08000000"
+        bin: ""
+        interface: cmsis-dap
+        target: py32f071
+      pyOCD:
+        baseAddr: "0x08000000"
+        bin: ""
+        config: .eide/debug.pyocd.yaml
+        otherCmds: '"--pack=${env:PYSDEPATH}/packs/PY32F0xx_DFP.pack"'
+        speed: 4M
+        targetName: PY32F071xB
+    uploader: OpenOCD
