@@ -102,6 +102,10 @@ Windows 默认不认识这个设备，需要手动指定 Cypress 的驱动：
 4. 选择 `firmware/prebuilt/Alternative_ADI_USBI.hex`（或自己编译出来的 hex），点下载；
 5. 烧完断开 BOOT0 拉低（恢复悬空），**重新上电**，固件就开始运行了。
 
+<img src="images/py32-dfu-tool.png" alt="PY32 DfuTool V1.1.2 烧录界面" width="420">
+
+*PY32 DfuTool V1.1.2 的实际界面：`DFU Device` 一栏自动识别到 `PY32F072 - ARM Device in DFU Mode`，`APP File` 选好 hex，勾上 `Program` + `Verify`，点 **Download**；日志出现 `Programming Done.` / `Verify OK.`、底部变成绿色 **PASS** 就烧好了。*
+
 ### LED 状态说明
 
 | 状态 | 颜色 / 表现 |
@@ -241,6 +245,10 @@ Windows does not know this device out of the box, so you have to point it at the
 3. Launch `PY32_DfuTool_V1.1.2\PY32DfuTool_x64.exe` (use `_x86` on 32-bit systems); the tool detects the device automatically;
 4. Select `firmware/prebuilt/Alternative_ADI_USBI.hex` (or your own build), then click download;
 5. Release BOOT0 (leave it floating) and **power-cycle the board** — the new firmware starts running.
+
+<img src="images/py32-dfu-tool.png" alt="PY32 DfuTool V1.1.2 flashing window" width="420">
+
+*The actual PY32 DfuTool V1.1.2 window: the `DFU Device` field auto-detects `PY32F072 - ARM Device in DFU Mode`, pick your hex in `APP File`, tick `Program` + `Verify` and hit **Download**. When the log shows `Programming Done.` / `Verify OK.` and the bar turns green **PASS**, the board is flashed.*
 
 ### Build & use
 
