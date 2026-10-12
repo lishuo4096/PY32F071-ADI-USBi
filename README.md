@@ -51,7 +51,7 @@ ADAU145x 的从机控制口**上电默认是 I2C**，但一旦被连续拉低 3 
 |---|---|
 | MCU | PY32F071K1BU6（Cortex-M0+，48 MHz，128 KB Flash / 16 KB RAM，QFN32） |
 | 时钟 | 内部 HSI 24 MHz + PLL ×2 = 48 MHz，**无外部晶振** |
-| USB | 全速 12 Mbps 设备，仅用 EP0 |
+| USB | 全速 12 Mbps 设备，仅用 EP0；`D+` 需 **1.5 kΩ 上拉到 3.3 V**（全速设备标识） |
 | 外围器件 | 1 颗 WS2812(B) 灯珠 + 若干去耦电容，**无 EEPROM、无晶振** |
 | 资源占用 | `text 19032 / data 4216 / bss 3336` → RAM 6672 / 16384 B，Flash ≈ 23 KB / 128 KB |
 
@@ -70,6 +70,37 @@ ADAU145x 的从机控制口**上电默认是 I2C**，但一旦被连续拉低 3 
 SPI 参数：主机模式、Mode 0（CPOL=0 / CPHA=1Edge）、MSB first、8 bit、分频 16 → **3 MHz**。`SS` 由软件在每次事务前后拉低/拉高。
 
 ADAU 地址语义：`>= 0xF000` 为寄存器，按字节递增；`< 0xF000` 为存储器，按 4 字节字递增（`usbi.c` 的 `bus_write_at()` 已处理）。
+
+### 预编译固件
+
+不想折腾编译环境的，直接烧这两个文件：
+
+| 文件 | 说明 |
+|---|---|
+| `firmware/prebuilt/Alternative_ADI_USBI.hex` | Intel HEX，用 PY32 DFU 工具 / 编程器直接下载 |
+| `firmware/prebuilt/Alternative_ADI_USBI.bin` | 原始二进制镜像（烧录起始地址 `0x08000000`） |
+
+（对应当前 V1.0 源码，`text 19032 / data 4216 / bss 3328`。）
+
+### 安装驱动（Windows）
+
+Windows 默认不认识这个设备，需要手动指定 Cypress 的驱动：
+
+1. 把板子插上 USB。打开**设备管理器**，会看到一个带黄色感叹号的 **未知设备 / Unknown Device**；
+2. 右键该设备 → **更新驱动程序** → **浏览我的电脑上的驱动程序**；
+3. 点"浏览"，选择本仓库 `driver\` 下**与你系统对应**的文件夹（Win10 / Win11 64 位选 `driver\Win10\x64`，32 位选 `driver\Win10\x86`；Win7 选 `driver\Win7\x64`，Win8 / 8.1 / Vista / XP 以此类推），勾选**包括子文件夹**，确定；
+4. 安装完成后，设备名会变成 **Cypress FX2LP No EEPROM Device** —— 这时 SigmaStudio 就能认出 USBi 了。
+
+> **说明**：这是**原版社区 CY7C68013A 版 USBi 的驱动安装过程**，本项目直接借用了 Cypress 的驱动层（CyUSB3）。之所以能这么做，是因为固件对外的 VID/PID 与描述符形状（单接口 `class 0xFF`、零端点）和官方 USBi 完全一致，SigmaStudio 和 CyUSB 认的正是这一层。
+> 文件夹里的 `ADI_USBi.spt` 是官方 USBi 的 8051 固件镜像，**本项目不需要它**，留在这里仅作参考。
+
+### 烧录固件（PY32 DFU）
+
+1. 把 **`PF8`（BOOT0）引脚拉低**，然后给板子上电 —— 单片机进入 ROM bootloader，不再运行用户程序；
+2. 用 USB 线把板子连到电脑；
+3. 打开 `PY32_DfuTool_V1.1.2\PY32DfuTool_x64.exe`（32 位系统用 `_x86`），工具里会自动识别到设备；
+4. 选择 `firmware/prebuilt/Alternative_ADI_USBI.hex`（或自己编译出来的 hex），点下载；
+5. 烧完断开 BOOT0 拉低（恢复悬空），**重新上电**，固件就开始运行了。
 
 ### LED 状态说明
 
@@ -94,8 +125,9 @@ ADAU 地址语义：`>= 0xF000` 为寄存器，按字节递增；`< 0xF000` 为�
 
 ```
 main/
-├─ driver/                 USB 驱动相关
+├─ driver/                 Cypress CyUSB3 驱动（按系统分文件夹，见上文驱动安装）
 ├─ firmware/               ← 本项目的 EIDE 固件工程
+│  ├─ prebuilt/            预编译固件（Alternative_ADI_USBI.hex / .bin，V1.0）
 │  ├─ Core/                main.c、usbi.c（协议+总线后端）、usbi_led.c、ws2812.c 等
 │  ├─ Drivers/             PY32F071 HAL / CMSIS
 │  ├─ Middlewares/         CherryUSB USB 协议栈 + FreeRTOS
@@ -159,7 +191,7 @@ The I²C backend is in fact **already written** (address probing, chunked writes
 |---|---|
 | MCU | PY32F071K1BU6 (Cortex-M0+, 48 MHz, 128 KB flash / 16 KB RAM, QFN32) |
 | Clock | Internal HSI 24 MHz × PLL2 = 48 MHz, **no external crystal** |
-| USB | Full-speed 12 Mbps device, EP0 only |
+| USB | Full-speed 12 Mbps device, EP0 only; `D+` needs a **1.5 kΩ pull-up to 3.3 V** (full-speed device signature) |
 | External parts | One WS2812(B) LED plus decoupling, **no EEPROM, no crystal** |
 | Footprint | `text 19032 / data 4216 / bss 3336` → RAM 6672 / 16384 B, flash ≈ 23 KB / 128 KB |
 
@@ -178,6 +210,37 @@ The I²C backend is in fact **already written** (address probing, chunked writes
 SPI: master, Mode 0 (CPOL=0 / CPHA=1Edge), MSB first, 8-bit, prescaler 16 → **3 MHz**; `SS` is driven low/high in software around each transaction.
 
 ADAU addressing: addresses `>= 0xF000` are registers (byte-incrementing) and `< 0xF000` are memories (4-byte word incrementing); see `bus_write_at()` in `usbi.c`.
+
+### Prebuilt firmware
+
+No toolchain required — flash one of these:
+
+| File | Notes |
+|---|---|
+| `firmware/prebuilt/Alternative_ADI_USBI.hex` | Intel HEX, ready for the PY32 DFU tool or any programmer |
+| `firmware/prebuilt/Alternative_ADI_USBI.bin` | Raw binary image (load address `0x08000000`) |
+
+(Built from the current V1.0 sources: `text 19032 / data 4216 / bss 3328`.)
+
+### Installing the driver (Windows)
+
+Windows does not know this device out of the box, so you have to point it at the Cypress driver manually:
+
+1. Plug the board into USB. In **Device Manager** an **Unknown Device** appears with a yellow warning triangle;
+2. Right-click it → **Update driver** → **Browse my computer for drivers**;
+3. Click *Browse* and select the folder under `driver\` that **matches your OS** (Windows 10 / 11 64-bit → `driver\Win10\x64`, 32-bit → `driver\Win10\x86`; Windows 7 → `driver\Win7\x64`, and likewise for Win8 / 8.1 / Vista / XP). Keep **Include subfolders** checked and confirm;
+4. Once it finishes, the device is renamed to **Cypress FX2LP No EEPROM Device** — SigmaStudio will now find the USBi.
+
+> **Note**: this is the very same driver installation procedure as the **original community CY7C68013A-based USBi**; this project simply reuses the Cypress driver layer (CyUSB3). That works because the firmware presents exactly the same VID/PID and descriptor shape as the official USBi (single `class 0xFF` interface, zero endpoints) — which is precisely the layer SigmaStudio and CyUSB look at.
+> The `ADI_USBi.spt` file in that folder is the official USBi's 8051 firmware image; **this project does not need it** — it is kept for reference only.
+
+### Flashing the firmware (PY32 DFU)
+
+1. Pull the **`PF8` (BOOT0) pin low**, then power the board up — the MCU enters its ROM bootloader instead of running the application;
+2. Connect the board to your PC with a USB cable;
+3. Launch `PY32_DfuTool_V1.1.2\PY32DfuTool_x64.exe` (use `_x86` on 32-bit systems); the tool detects the device automatically;
+4. Select `firmware/prebuilt/Alternative_ADI_USBI.hex` (or your own build), then click download;
+5. Release BOOT0 (leave it floating) and **power-cycle the board** — the new firmware starts running.
 
 ### Build & use
 
