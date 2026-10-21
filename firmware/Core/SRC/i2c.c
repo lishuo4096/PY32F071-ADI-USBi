@@ -81,12 +81,17 @@ void Studio_I2C1_Init(void)
   /* USER CODE END Studio_I2C1_Init 0 */
   
   hi2c1.Instance = I2C1;
+  /* ★ 正版 USBi 的 DSP 侧 I2C 固定 400 kHz，这里默认值就按它（usbi.h 的
+   * USBI_I2C_CLOCK_HZ 会在 i2c_bus_setup() 里再覆盖一次，两处保持一致）。 */
   hi2c1.Init.ClockSpeed = 400000;
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
-  hi2c1.Init.OwnAddress1 = 0xA0;
+  /* ★ 下面三项原本是 0xA0 / I2C_DUALADDRESS_ENABLE / 0xA0 —— 那是把芯片当
+   * I2C 从机的配置，而本工程只做主机，留着只会在总线上响应自己的地址。
+   * 主机模式必须关掉。 */
+  hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
-  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_ENABLE;
-  hi2c1.Init.OwnAddress2 = 0xA0;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
   hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
   hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
   if (HAL_I2C_Init(&hi2c1) != HAL_OK)

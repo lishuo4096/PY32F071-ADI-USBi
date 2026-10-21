@@ -10,9 +10,10 @@
   *       中断端点，SigmaStudio 只用 EP0 的 vendor 请求）。
   *    2) vendor_handler：实现 0xB2 写寄存器 / 0xB3 读请求 / 0xB4 读响应 /
   *       0xB5、0xB6 ACK；未知请求一律让 core STALL（绝不能 panic 或死循环）。
-  *    3) 总线后端：V1.0 只使用 SPI（片选 PA4 由软件控制，见 spi_io_init）。
-  *       I2C 后端整段归档在本文件的"V1.0 存档"段里（#if 0），I2C1 外设本身仍
-  *       照常初始化（Core/SRC/i2c.c 的 Studio_I2C1_Init）。
+  *    3) 总线后端：SPI（片选 PA4 由软件控制，见 spi_io_init）或 I2C（硬件
+  *       I2C1 + HAL，400 kHz，PA9=SCL / PA10=SDA；引脚/时钟/分块大小见 usbi.h
+  *       的 USBI_BUS_SELECT 与 USBI_I2C_* 宏）。
+  *       两档共用同一套 vendor 请求处理，切换只需改宏重新编译。
   *    4) RESET 输出（PB0）：常态推挽输出高（释放复位）；固件不主动复位目标。
   *    5) 烧录识别 / "主机启动 DSP"序列识别：**只驱动指示灯**，不触发任何复位。
   *
@@ -91,13 +92,20 @@ static volatile uint8_t s_pending_read_valid;
  * CONFIG_USBDEV_REQUEST_BUFFER_LEN 字节的 req_data（usbd_core.c:850-859）。 */
 static uint8_t s_read_buf[USBI_READ_BUF_SIZE] __attribute__((aligned(4)));
 
-/* 0xB5 / 0xB6 的固定返回值 */
-static uint8_t s_ack_byte = USBI_ACK_BYTE;
+/* 0xB5 / 0xB6 返回的"上一次传输状态"：ADIUSBi.dll 的 TransferStatus，
+ * 1 = Success、3 = Failed（抓包与 adau1452-esp32-controller 一致）。
+ * SPI 是开环的，失败极少；I2C 有 ACK，总线 NACK 必须如实报上去，否则 SigmaStudio
+ * 会把一次写失败的下载当成成功。 */
+#define USBI_ST_SUCCESS 1u
+#define USBI_ST_FAILED  3u
+
+static uint8_t s_write_status = USBI_ST_SUCCESS;
+static uint8_t s_read_status  = USBI_ST_SUCCESS;
 
 /* 总线是否已初始化（SPI/I2C 初始化在 USB 初始化之后） */
 static volatile uint8_t s_bus_ready;
 
-/* 当前生效的总线。V1.0 只有 SPI 一条路径；I2C 相关常量与函数都在存档段里 */
+/* 当前生效的总线（USBI_BUS_SPI / USBI_BUS_I2C），由 usbi_bus_set() 决定 */
 static volatile uint8_t s_bus = USBI_BUS_SPI;
 
 /* ---- 烧录 / 会话结束识别状态（USB 中断里更新，主循环里消费） ----
@@ -137,14 +145,7 @@ static void reset_pin_assert(void);
 static void spi_io_init(void);
 static void spi_cs(int active);
 
-/* I2C 后端的函数原型 —— 见本文件末尾的"V1.0 存档"段
-#if 0
-static int  i2c_probe(uint8_t *addr_out);
-static uint16_t i2c_chunk(uint16_t sub, uint16_t len, uint8_t read);
-static uint16_t i2c_next_sub(uint16_t sub, uint16_t bytes);
-static void i2c_delay_us(uint32_t us);
-#endif
-*/
+/* I2C 后端（硬件 I2C1 + HAL）的函数定义在"总线分发"之前，这里不需要额外原型 */
 
 static void flash_track(uint16_t reg, uint16_t len);
 
@@ -331,22 +332,167 @@ static int bus_spi_read(uint16_t reg, uint8_t *data, uint16_t len)
     return 0;
 }
 
-/* ======================= V1.0 存档：I2C 后端 =======================
- * 这一整段是"已经写完、但没在硬件上验证"的 I2C 实现（I2C1 = PA9/PA10 @400 kHz，
- * 从机地址探测 0x38~0x3B）。V1.0 只发布 SPI，所以用 #if 0 归档。
+/* ========================= I2C 后端（硬件 I2C1 + HAL） =========================
+ * 正版 USBi 的 DSP 侧 I2C 固定 400 kHz，所以这里直接用硬件 I2C1：
+ *   SCL = PA9、SDA = PA10（AF6、开漏、内部上拉），配置在 Core/SRC/i2c.c 里。
  *
- * 要恢复 I2C 支持：把本段 #if 0 改成 #if 1，并同样恢复"总线分发"、"usbi_bus_set"、
- * "usbi_init"里标了 #if 0 的 I2C 分支，以及 usbi.h 里 USBI_BUS_SELECT 的取值。
+ * ★★ 前提条件（改这里之前先看懂）★★
+ *   vendor 请求全部在 USB 中断里执行，而 HAL 的每一处等待都是
+ *       while (!flag) { if (HAL_GetTick() - tickstart > Timeout) 报错; }
+ *   SysTick 是 HAL_GetTick() 的唯一时基。如果 SysTick 的优先级低于 USB 中断，
+ *   USB 中断期间 uwTick 不前进 → 超时判断永远为假 → 总线一旦被从机拉死，
+ *   中断就永久卡在 while 里，只能等 IWDG 把整机复位、USB 重枚举。
+ *   因此本工程做了两件事（缺一不可）：
+ *     1) py32f071_hal_conf.h: TICK_INT_PRIORITY = 0（SysTick 最高优先级）
+ *     2) Core/SRC/usb.c: USB_IRQn 的优先级 = 1（让 SysTick 能抢占它）
+ *   这样 HAL 的超时在中断里是真生效的：最坏情况是等 USBI_I2C_TIMEOUT_MS
+ *   之后返回 HAL_ERROR，中断照常退出，下一次请求还能重来。
  *
- * 硬件约束（ADAU1452/1451/1450 Rev.D）：
- *   - 从机口上电默认 I2C；SS/ADDR0 被拉低 3 次就永久进入 SPI 模式，回 I2C 只能靠
- *     RESET 引脚硬件复位或断电（软复位 0xF890 也不行）。
- *   - SDA = MISO/SDA 脚，SCL = CCLK/SCL 脚，两条线各需一个 2 kΩ 上拉。
- *   - 地址 bit1/bit2 由 SS/ADDR0、MOSI/ADDR1 硬接线决定（都悬空 = 0x3B）。
- * ================================================================ */
-#if 0
-/* 目标 I2C 7 位地址（探测得到） */
-static uint8_t s_i2c_addr = USBI_I2C_ADDR_MAX;
+ * ★ 出错恢复：HAL 传输失败后 hi2c1.State 会停在 BUSY_TX / BUSY_RX，
+ *   之后所有调用都直接返回 HAL_BUSY（连 START 都不会发）。所以每次失败都
+ *   必须 DeInit/Init，并把 9 个时钟打到总线上把从机卡住的 SDA 顶出来。
+ *
+ * 分块、子地址推进、程序区 300 µs settle 与参考工程 adau1452-esp32-controller
+ * 完全一致，只把"比特怎么打"从软件模拟换成了外设。
+ */
+
+/* 7 位从机地址（0x38~0x3B，ADAU145x 由 ADDR0/ADDR1 决定） */
+static uint8_t s_i2c_addr = USBI_I2C_ADDR_DEFAULT;
+
+/* 引脚：正常传输时由 I2C1 外设占用，只在"总线恢复"时临时当 GPIO 用 */
+#define I2C_SCL_PORT USBI_I2C_SCL_PORT
+#define I2C_SCL_PIN  USBI_I2C_SCL_PIN
+#define I2C_SDA_PORT USBI_I2C_SDA_PORT
+#define I2C_SDA_PIN  USBI_I2C_SDA_PIN
+
+#define I2C_SCL_HIGH() (I2C_SCL_PORT->BSRR = (uint32_t)I2C_SCL_PIN)
+#define I2C_SCL_LOW()  (I2C_SCL_PORT->BSRR = (uint32_t)I2C_SCL_PIN << 16)
+#define I2C_SDA_HIGH() (I2C_SDA_PORT->BSRR = (uint32_t)I2C_SDA_PIN)
+#define I2C_SDA_LOW()  (I2C_SDA_PORT->BSRR = (uint32_t)I2C_SDA_PIN << 16)
+#define I2C_SDA_LEVEL() (((I2C_SDA_PORT->IDR & I2C_SDA_PIN) != 0u) ? 1u : 0u)
+
+/**
+  * @brief 忙等若干微秒（用 SysTick 计数器，**在中断里也能用**）
+  *
+  * 不用 HAL_Delay：它依赖中断里的 uwTick，而这种等待都发生在 USB 中断里。
+  * SysTick->VAL 是硬件计数器，CPU 在中断里它照样在跑。
+  * 单次最多一个 SysTick 周期（1 ms），够 300 µs 的 settle 用。
+  */
+static void i2c_delay_us(uint32_t us)
+{
+    uint32_t load = SysTick->LOAD + 1u;
+    uint32_t total = us * (SystemCoreClock / 1000000u);
+    uint32_t start;
+    uint32_t now;
+    uint32_t elapsed;
+
+    if (total == 0u) {
+        return;
+    }
+    if (total >= load) {
+        total = load - 1u;              /* 夹到一个 SysTick 周期内，保证有界 */
+    }
+    start = SysTick->VAL;
+    do {
+        now = SysTick->VAL;
+        elapsed = (start >= now) ? (start - now) : (start + load - now);
+    } while (elapsed < total);
+}
+
+/**
+  * @brief 把 SCL/SDA 从 I2C1 外设手上夺过来，改成开漏 GPIO
+  */
+static void i2c_pins_as_gpio(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+
+    __HAL_I2C_DISABLE(&hi2c1);
+
+    HAL_GPIO_DeInit(I2C_SCL_PORT, I2C_SCL_PIN);
+    HAL_GPIO_DeInit(I2C_SDA_PORT, I2C_SDA_PIN);
+
+    gpio.Mode  = GPIO_MODE_OUTPUT_OD;
+    gpio.Pull  = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+
+    gpio.Pin = I2C_SCL_PIN;
+    HAL_GPIO_Init(I2C_SCL_PORT, &gpio);
+    gpio.Pin = I2C_SDA_PIN;
+    HAL_GPIO_Init(I2C_SDA_PORT, &gpio);
+
+    I2C_SCL_HIGH();
+    I2C_SDA_HIGH();
+}
+
+/**
+  * @brief 总线恢复 + 重新初始化 I2C1
+  *
+  * 从机在半个字节中间被复位/断电时会把 SDA 拉低不放，这时主机发的 START
+  * 永远等不到（硬件上表现为 BUSY 一直置位）。标准解法是补最多 9 个时钟，
+  * 让它把剩下的数据位吐完、放开 SDA，再补一个 STOP。
+  * 全程有上界（9 个时钟 / 每次 5 µs），不会死等。
+  */
+static void i2c_bus_recover(void)
+{
+    uint8_t i;
+
+    i2c_pins_as_gpio();
+    i2c_delay_us(5);
+
+    for (i = 0u; (i < 9u) && (I2C_SDA_LEVEL() == 0u); i++) {
+        I2C_SCL_LOW();
+        i2c_delay_us(5);
+        I2C_SCL_HIGH();
+        i2c_delay_us(5);
+    }
+
+    /* 补一个 STOP：SCL 低 → SDA 低 → SCL 高 → SDA 高 */
+    I2C_SCL_LOW();
+    i2c_delay_us(5);
+    I2C_SDA_LOW();
+    i2c_delay_us(5);
+    I2C_SCL_HIGH();
+    i2c_delay_us(5);
+    I2C_SDA_HIGH();
+    i2c_delay_us(5);
+
+    /* 引脚交还给 I2C1（MspInit 里会重新配成 AF6 开漏并复位外设） */
+    (void)HAL_I2C_DeInit(&hi2c1);
+    hi2c1.Init.ClockSpeed = USBI_I2C_CLOCK_HZ;
+    (void)HAL_I2C_Init(&hi2c1);
+}
+
+/**
+  * @brief 带重试的 I2C 事务（每失败一次就做总线恢复再重来）
+  *
+  * @param write  1 = 写，0 = 读
+  * @param sub    16 位子地址（大端先发，HAL 的 MEMADD_SIZE_16BIT 负责）
+  * @retval 0 = 成功；-1 = 重试用尽仍失败
+  */
+static int i2c_txn(uint8_t write, uint16_t sub, uint8_t *data, uint16_t len)
+{
+    uint8_t tries = USBI_I2C_RETRIES;
+    uint16_t dev = (uint16_t)((uint16_t)s_i2c_addr << 1);
+
+    do {
+        HAL_StatusTypeDef st;
+
+        if (write != 0u) {
+            st = HAL_I2C_Mem_Write(&hi2c1, dev, sub, I2C_MEMADD_SIZE_16BIT,
+                                   data, len, USBI_I2C_TIMEOUT_MS);
+        } else {
+            st = HAL_I2C_Mem_Read(&hi2c1, dev, sub, I2C_MEMADD_SIZE_16BIT,
+                                  data, len, USBI_I2C_TIMEOUT_MS);
+        }
+        if (st == HAL_OK) {
+            return 0;
+        }
+        i2c_bus_recover();
+        tries = (uint8_t)(tries - 1u);
+    } while (tries != 0u);
+
+    return -1;
+}
 
 /**
   * @brief 在 I2C 总线上探测 ADAU（地址 0x38~0x3B）
@@ -354,12 +500,17 @@ static uint8_t s_i2c_addr = USBI_I2C_ADDR_MAX;
   */
 static int i2c_probe(uint8_t *addr_out)
 {
-    for (uint8_t addr = USBI_I2C_ADDR_MIN; addr <= USBI_I2C_ADDR_MAX; addr++) {
-        if (HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(addr << 1),
-                                  USBI_I2C_PROBE_TRIALS,
-                                  USBI_I2C_PROBE_TIMEOUT_MS) == HAL_OK) {
-            *addr_out = addr;
-            return 0;
+    uint8_t addr;
+    uint8_t trial;
+
+    for (addr = USBI_I2C_ADDR_MIN; addr <= USBI_I2C_ADDR_MAX; addr++) {
+        for (trial = 0u; trial < USBI_I2C_PROBE_TRIALS; trial++) {
+            if (HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)((uint16_t)addr << 1),
+                                      1u, USBI_I2C_TIMEOUT_MS) == HAL_OK) {
+                *addr_out = addr;
+                return 0;
+            }
+            i2c_bus_recover();
         }
     }
     return -1;
@@ -382,73 +533,39 @@ static uint16_t i2c_next_sub(uint16_t sub, uint16_t bytes)
 /**
   * @brief 单次 I2C 事务允许的数据字节数
   *
-  * 与 adau1452-esp32-controller 的实测值一致：寄存器区 ≤24、程序区一个 32 位字、
-  * 参数区 ≤28（保持 4 字节对齐）、读方向放宽到 96 以减少事务数。
+  * 与 adau1452-esp32-controller 的实测值一致：寄存器区 ≤24、程序区快路径
+  * 248（保守路径一个 32 位字）、参数区 ≤28（4 字节对齐）、读方向 240。
   */
 static uint16_t i2c_chunk(uint16_t sub, uint16_t len, uint8_t read)
 {
     uint16_t limit;
 
     if (sub >= USBI_ADDR_REG_BASE) {
-        limit = USBI_I2C_CHUNK_REG;
+        limit = (read != 0u) ? USBI_I2C_CHUNK_READ_REG : USBI_I2C_CHUNK_REG;
     } else if (sub >= USBI_ADDR_PROG_BASE) {
-        limit = read ? USBI_I2C_CHUNK_READ_RAM : USBI_I2C_CHUNK_PROG;
+        limit = (read != 0u) ? USBI_I2C_CHUNK_READ_RAM : USBI_I2C_CHUNK_PROG;
     } else {
-        limit = read ? USBI_I2C_CHUNK_READ_RAM : USBI_I2C_CHUNK_PARAM;
+        limit = (read != 0u) ? USBI_I2C_CHUNK_READ_RAM : USBI_I2C_CHUNK_PARAM;
+    }
+    if (limit == 0u) {
+        limit = 1u;
     }
     return (len > limit) ? limit : len;
 }
 
 /**
-  * @brief 基于 SysTick 的微秒级忙等
-  *
-  * 这段代码可能在 USB 中断里跑（SysTick 中断被挂起，HAL_Delay 会死等），
-  * 所以只能读 SysTick 的硬件计数器。只支持 < 1 ms 的等待。
-  */
-static void i2c_delay_us(uint32_t us)
-{
-    uint32_t ticks;
-    uint32_t start;
-    uint32_t load;
-
-    if (us == 0u) {
-        return;
-    }
-    ticks = us * (SystemCoreClock / 1000000u);
-    load = SysTick->LOAD + 1u;
-    if (ticks >= load) {
-        ticks = load - 1u;      /* 最长只等一个 SysTick 周期 */
-    }
-    start = SysTick->VAL;
-    while (1) {
-        uint32_t now = SysTick->VAL;
-        uint32_t elapsed = (start >= now) ? (start - now)
-                                          : (start + load - now);
-        if (elapsed >= ticks) {
-            break;
-        }
-    }
-}
-
-/**
-  * @brief I2C 写：2 字节大端子地址 + 数据，按区域分块
+  * @brief I2C 写：按区域分块，每块 = 2 字节子地址 + 数据（一个完整事务）
   */
 static int bus_i2c_write(uint16_t reg, const uint8_t *data, uint16_t len)
 {
-    static uint8_t buf[USBI_I2C_CHUNK_PARAM + 2u];
     uint16_t sub = reg;
 
-    while (len) {
+    while (len != 0u) {
         uint16_t chunk = i2c_chunk(sub, len, 0u);
-        int is_prog = (sub >= USBI_ADDR_PROG_BASE) && (sub < USBI_ADDR_REG_BASE);
+        uint8_t is_prog = (uint8_t)((sub >= USBI_ADDR_PROG_BASE) &&
+                                    (sub < USBI_ADDR_REG_BASE));
 
-        buf[0] = (uint8_t)(sub >> 8);
-        buf[1] = (uint8_t)(sub & 0xFFu);
-        memcpy(&buf[2], data, chunk);
-
-        if (HAL_I2C_Master_Transmit(&hi2c1, (uint16_t)(s_i2c_addr << 1),
-                                    buf, (uint16_t)(chunk + 2u),
-                                    HAL_MAX_DELAY) != HAL_OK) {
+        if (i2c_txn(1u, sub, (uint8_t *)data, chunk) != 0) {
             return -1;
         }
 
@@ -456,7 +573,8 @@ static int bus_i2c_write(uint16_t reg, const uint8_t *data, uint16_t len)
         data += chunk;
         len = (uint16_t)(len - chunk);
 
-        if (is_prog && len) {
+        /* 程序内存区写完一块要停一下让 DSP 真正吃掉（参考工程的 300 µs） */
+        if ((is_prog != 0u) && (len != 0u)) {
             i2c_delay_us(USBI_I2C_PROG_WORD_DELAY_US);
         }
     }
@@ -464,18 +582,16 @@ static int bus_i2c_write(uint16_t reg, const uint8_t *data, uint16_t len)
 }
 
 /**
-  * @brief I2C 读：写子地址 + repeated START + 读数据（HAL_I2C_Mem_Read）
+  * @brief I2C 读：写子地址 + 重复 START + 读数据（HAL_I2C_Mem_Read 内部完成）
   */
 static int bus_i2c_read(uint16_t reg, uint8_t *data, uint16_t len)
 {
     uint16_t sub = reg;
 
-    while (len) {
+    while (len != 0u) {
         uint16_t chunk = i2c_chunk(sub, len, 1u);
 
-        if (HAL_I2C_Mem_Read(&hi2c1, (uint16_t)(s_i2c_addr << 1), sub,
-                             I2C_MEMADD_SIZE_16BIT, data, chunk,
-                             HAL_MAX_DELAY) != HAL_OK) {
+        if (i2c_txn(0u, sub, data, chunk) != 0) {
             return -1;
         }
 
@@ -485,26 +601,46 @@ static int bus_i2c_read(uint16_t reg, uint8_t *data, uint16_t len)
     }
     return 0;
 }
-#endif /* V1.0 存档：I2C 后端 */
+
+/**
+  * @brief 准备 I2C1 主机并探测目标
+  *
+  * 只在主循环上下文调用（usbi_init / usbi_bus_set）。
+  *
+  * @retval 0 = 探测到目标；-1 = 总线上没有响应（主机照样准备好，后续传输会失败）
+  */
+static int i2c_bus_setup(void)
+{
+    /* 上一次会话可能把 State 留在 BUSY 里，先复位再重配 */
+    (void)HAL_I2C_DeInit(&hi2c1);
+    hi2c1.Init.ClockSpeed = USBI_I2C_CLOCK_HZ;
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK) {
+        return -1;
+    }
+
+    /* 先清一次可能被拉住的总线（内含 DeInit/Init），再探测 */
+    i2c_bus_recover();
+
+    s_i2c_addr = USBI_I2C_ADDR_DEFAULT;
+    return i2c_probe(&s_i2c_addr);
+}
 
 /* =========================== 总线分发 =========================== */
+/* 上层（vendor 请求、块写流式转发）完全不关心底下是哪条总线，
+ * 只有这两处按 s_bus 分叉。 */
 static int bus_write(uint16_t reg, const uint8_t *data, uint16_t len)
 {
-#if 0   /* V1.0：I2C 已归档 */
     if (s_bus == USBI_BUS_I2C) {
         return bus_i2c_write(reg, data, len);
     }
-#endif
     return bus_spi_write(reg, data, len);
 }
 
 static int bus_read(uint16_t reg, uint8_t *data, uint16_t len)
 {
-#if 0   /* V1.0：I2C 已归档 */
     if (s_bus == USBI_BUS_I2C) {
         return bus_i2c_read(reg, data, len);
     }
-#endif
     return bus_spi_read(reg, data, len);
 }
 
@@ -537,36 +673,51 @@ uint8_t usbi_bus_get(void)
 }
 
 /**
-  * @brief 运行时切换总线（V1.0：只有 SPI 一条路径）
+  * @brief 切换（或首次选定）目标总线
+  *
+  * **只能在主循环上下文调用**：切到 I2C 时要用 usbi_target_reset_pulse()，
+  * 里面有 HAL_Delay()，在 USB 中断里会死等。
   *
   * 切到 SPI：只把片选/SPI 外设准备好即可。**不主动发脉冲切模式** ——
   *   SigmaStudio 每次下载都会自己连发 3 次 "SPI Toggle"（向 0x4FFF 写 4 字节
   *   0x00，中间夹 "SPI Toggle Delay"），每次 SPI 事务天然在 SS/ADDR0 上产生
   *   一个低-高脉冲，三次就把目标切进 SPI 模式了。
-  * 切到 I2C：已归档（见本文件的"V1.0 存档：I2C 后端"段）。目标一旦进过 SPI
-  *   模式就只能靠硬件复位回 I2C（手册明确 0xF890 软复位也不行），因此恢复 I2C
-  *   时必须先复位目标再探测。
+  * 切到 I2C：必须先硬件复位目标。ADAU145x 一旦进过 SPI 模式就再也回不到 I2C
+  *   （手册明确软复位 0xF890 也不行），只有 RESET 引脚能救。
+  *   USBI_BUS_AUTO 例外：探测时目标本来就好好答话，不必再复位它。
   */
 void usbi_bus_set(uint8_t bus)
 {
-#if 0   /* V1.0：I2C 已归档。恢复本分支同时要恢复上面的 i2c_probe 存档段 */
-    if (bus == USBI_BUS_I2C) {
-        s_bus_ready = 0u;
-        usbi_target_reset_pulse();   /* 回 I2C 必须硬件复位 */
-        (void)i2c_probe(&s_i2c_addr);
-        /* 探测不到目标也照样切成 I2C：主机可能只是先把模式设好 */
-        s_bus = USBI_BUS_I2C;
-        s_bus_ready = 1u;
-        usbi_led_set_bus(s_bus);     /* 指示灯色相跟着走 */
-        return;
-    }
-#endif
+    uint8_t do_reset = 1u;
 
-    if (bus == USBI_BUS_SPI) {
-        s_bus = USBI_BUS_SPI;
-        spi_io_init();
-        usbi_led_set_bus(s_bus);
+    if (bus == USBI_BUS_AUTO) {
+        /* 先探测：I2C 上有从机答话就走 I2C，否则退回 SPI */
+        if (i2c_bus_setup() == 0) {
+            bus = USBI_BUS_I2C;
+            do_reset = 0u;          /* 刚探测到，别再复位 */
+        } else {
+            bus = USBI_BUS_SPI;
+        }
     }
+
+    if (bus == USBI_BUS_I2C) {
+        s_bus_ready = 0u;           /* 切换过程中别让 vendor 请求动总线 */
+        if (do_reset != 0u) {
+            usbi_target_reset_pulse();
+        }
+        /* SS/ADDR0 保持高：地址低 2 位 = 0b11（0x3B），也不给 SPI 切换脉冲 */
+        spi_io_init();
+        if (do_reset != 0u) {
+            (void)i2c_bus_setup();  /* 探测不到也照样切：主机可能只是先把模式设好 */
+        }
+        s_bus = USBI_BUS_I2C;
+    } else {
+        spi_io_init();
+        s_bus = USBI_BUS_SPI;
+    }
+
+    s_bus_ready = 1u;
+    usbi_led_set_bus(s_bus);        /* 指示灯色相跟着走 */
 }
 
 /* ========================= 烧录 / 会话结束识别 ========================= */
@@ -619,7 +770,7 @@ static void boot_seq_track(uint16_t reg)
   */
 static void flash_track(uint16_t reg, uint16_t len)
 {
-    /* ① 烧 EEPROM（整幅镜像 / EEPROM 页数据） */
+    /* ① 烧 EEPROM（整幅镜像 / EEPROM 页数据）—— 判据只用来**首次点亮**烧录灯 */
     if (((reg < 0x0100u) && (len >= USBI_BURN_IMAGE_MIN_LEN)) ||
         ((reg == USBI_BURN_PAGE_REG) && (len >= USBI_BURN_PAGE_MIN_LEN))) {
         if (!s_burn_active) {
@@ -630,7 +781,22 @@ static void flash_track(uint16_t reg, uint16_t len)
         return;
     }
 
-    /* ② 主机启动 DSP 的序列（只可能出现在内核控制寄存器区） */
+    /* ② 灯已经亮着：**任何**一次写都算烧录活动，续上超时窗口
+     *
+     *    原来只有大块写才续窗口（"整幅镜像 / 页数据"那两条判据），于是烧录
+     *    过程中穿插的 2 字节 / 4 字节寄存器写完全不续 → 两条大块写之间一旦
+     *    超过 1500 ms，灯就被 usbi_task() 收掉，再被下一条大块写重新点亮。
+     *    用户看到的就是"只有 program data / dm0,dm1 data 会闪，单写寄存器
+     *    没反应"。
+     *
+     *    这里只续写、不续读：读是主机的常态轮询（SigmaStudio 空闲时一直在
+     *    读寄存器），若读也续窗口，烧录结束后轮询会把烧录色永久钉在灯上。
+     *    读命令的"响应"由 usbi_led_notify_read() 的闪灯相位拉回负责。 */
+    if (s_burn_active) {
+        s_burn_last_ms = HAL_GetTick();
+    }
+
+    /* ③ 主机启动 DSP 的序列（只可能出现在内核控制寄存器区） */
     if (reg >= USBI_ADDR_REG_BASE) {
         boot_seq_track(reg);
     }
@@ -671,6 +837,7 @@ static int usbi_ep0_out_stream(struct usb_setup_packet *setup, uint8_t *data,
         s_stream_reg = (uint16_t)(((uint16_t)data[0] << 8) | (uint16_t)data[1]);
         s_stream_data_written = 0u;
         s_stream_stage_len = 0u;
+        s_write_status = USBI_ST_SUCCESS;   /* 新请求：状态从头开始记 */
     }
 
     /* 请求头那 2 个字节只在第一块里，且不是数据 */
@@ -699,6 +866,7 @@ static int usbi_ep0_out_stream(struct usb_setup_packet *setup, uint8_t *data,
     if (n > 0u) {
         if (bus_write_at(s_stream_reg, (uint16_t)s_stream_data_written,
                          s_stream_stage, (uint16_t)n) != 0) {
+            s_write_status = USBI_ST_FAILED;   /* 总线失败要传给 0xB5 */
             return -1;
         }
         s_stream_data_written += n;
@@ -755,7 +923,8 @@ static int usbi_vendor_request(struct usb_setup_packet *setup, uint8_t **data, u
             }
 #endif
 
-            (void)bus_write(reg, &payload[2], (uint16_t)(wlen - 2u));
+            s_write_status = (bus_write(reg, &payload[2], (uint16_t)(wlen - 2u)) == 0)
+                             ? USBI_ST_SUCCESS : USBI_ST_FAILED;
 
             usbi_led_notify_write();
             flash_track(reg, (uint16_t)(wlen - 2u));
@@ -797,6 +966,9 @@ static int usbi_vendor_request(struct usb_setup_packet *setup, uint8_t **data, u
             if (bus_read(s_pending_read_reg, s_read_buf, (uint16_t)rd_len) != 0) {
                 /* 总线出错：补零，但绝不能破坏控制传输的包长/对齐 */
                 memset(s_read_buf, 0, rd_len);
+                s_read_status = USBI_ST_FAILED;
+            } else {
+                s_read_status = USBI_ST_SUCCESS;
             }
         }
 
@@ -808,9 +980,12 @@ static int usbi_vendor_request(struct usb_setup_packet *setup, uint8_t **data, u
         return 0;
     }
 
-    case USBI_REQ_READ_REGISTER_ACK:          /* 0xB5 */
-    case USBI_REQ_READ_REGISTER_RESPONSE_ACK: /* 0xB6 */
-        *data = &s_ack_byte;
+    case USBI_REQ_READ_REGISTER_ACK:          /* 0xB5：上一次写是否成功 */
+        *data = &s_write_status;
+        *len = 1u;
+        return 0;
+    case USBI_REQ_READ_REGISTER_RESPONSE_ACK: /* 0xB6：上一次读是否成功 */
+        *data = &s_read_status;
         *len = 1u;
         return 0;
 
@@ -869,22 +1044,21 @@ void usbi_init(void)
     usbi_target_reset_pulse();
 #endif
 
-    /* 片选引脚先准备好并保持高电平 */
+    /* 片选引脚先准备好并保持高电平（= SS/ADDR0 高：I2C 地址 0x3B，
+     * 而且不会给目标那 3 个"切到 SPI"的脉冲） */
     spi_io_init();
 
-    /* V1.0：固定 SPI。不主动发切模式脉冲，SigmaStudio 下载时会发 3 次 SPI Toggle。
-     * I2C / AUTO 的初始化分支已归档（见本文件的"V1.0 存档：I2C 后端"段）。 */
-    s_bus = USBI_BUS_SPI;
-#if 0
-    /* 归档：I2C 与 AUTO 探测
-    s_bus = USBI_BUS_I2C;
-    (void)i2c_probe(&s_i2c_addr);
-    if (i2c_probe(&s_i2c_addr) == 0) {
-        s_bus = USBI_BUS_I2C;
-    } else {
-        s_bus = USBI_BUS_SPI;
-    }
-    */
+    /* 按 USBI_BUS_SELECT 选总线：
+     *   USBI_BUS_SPI  —— 默认，保持原有行为
+     *   USBI_BUS_I2C  —— 硬件 I2C1（默认 PA9=SCL / PA10=SDA，400 kHz）
+     *   USBI_BUS_AUTO —— 先探测 I2C 从机，探测不到退回 SPI
+     * 三条路都会自己调用 spi_io_init()/i2c_bus_setup() 并把指示灯总线色设好。 */
+#if (USBI_BUS_SELECT == USBI_BUS_I2C)
+    usbi_bus_set(USBI_BUS_I2C);
+#elif (USBI_BUS_SELECT == USBI_BUS_AUTO)
+    usbi_bus_set(USBI_BUS_AUTO);
+#else
+    usbi_bus_set(USBI_BUS_SPI);
 #endif
 
     s_bus_ready = 1u;

@@ -37,9 +37,23 @@ extern "C" {
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 
-/* ========================= 目标总线选择 ========================= */
-/* V1.0 只使用 SPI。USBI_BUS_I2C / USBI_BUS_AUTO 仅用于标记 usbi.c 里已归档的
- * I2C 代码，选它们不会生效（usbi.c 的总线分发只有 SPI 一条路径）。 */
+/* ===================== 目标总线选择（编译期，真正生效） ===================== */
+/* 本宏决定"USB 控制端点背后那条总线"走哪组硬件：
+ *   USBI_BUS_SPI  —— SPI1（PA4 软件片选 + PA5 SCK + PA6 MISO + PA7 MOSI），默认
+ *   USBI_BUS_I2C  —— 硬件 I2C1（400 kHz，默认 PA9=SCL / PA10=SDA，见下面的引脚宏）
+ *   USBI_BUS_AUTO —— 上电先探测 I2C 从机（0x38~0x3B），探测到就走 I2C，否则退回 SPI
+ *
+ * USB 协议层完全不变：两档都是同一套 0xB2~0xB6 vendor 请求，差别只在"收到写
+ * 请求后往哪条总线上发"。SigmaStudio 侧的 wValue/wIndex 也照旧被忽略
+ * （参考工程 adau1452-esp32-controller 同样硬编码地址与 format）。
+ *
+ * ⚠ 从 SPI 切回 I2C 必须先硬件复位目标：ADAU145x 上电默认 I2C 从口，
+ *   SS/ADDR0 被拉低 3 次后永久进入 SPI 模式，软复位 0xF890 也回不来。
+ *
+ * ⚠ 硬件前提：I2C 的 SCL/SDA 各需要 2 kΩ 外部上拉。若板上只有 MCU 内部上拉
+ *   （约 30~50 kΩ），请把 USBI_I2C_CLOCK_HZ 降到 20000 及以下，否则上升沿
+ *   跟不上、读回全是 0xFF。
+ */
 #define USBI_BUS_SPI  0
 #define USBI_BUS_I2C  1
 #define USBI_BUS_AUTO 2
@@ -48,37 +62,101 @@ extern "C" {
 #define USBI_BUS_SELECT USBI_BUS_SPI
 #endif
 
+#if (USBI_BUS_SELECT != USBI_BUS_SPI) && \
+    (USBI_BUS_SELECT != USBI_BUS_I2C) && \
+    (USBI_BUS_SELECT != USBI_BUS_AUTO)
+#error "USBI_BUS_SELECT 只能是 USBI_BUS_SPI / USBI_BUS_I2C / USBI_BUS_AUTO"
+#endif
+
 /* SPI 片选引脚（mcustudio 里配的是 SPI1 硬件 NSS = PA4，
  * 本模块会在 usbi_init() 里把它收回当成普通 GPIO 用） */
 #define USBI_SPI_CS_PORT GPIOA
 #define USBI_SPI_CS_PIN  GPIO_PIN_4
 
-/* ==================== I2C 参数（V1.0 已归档，保留备查） ==================== */
-/* 这些常量只被 usbi.c 里 #if 0 包住的 I2C 后端引用。I2C1 外设本身仍然照常
- * 初始化（Core/SRC/i2c.c 的 Studio_I2C1_Init，PA9/PA10 @400 kHz），将来要恢复
- * I2C 支持时只需在 usbi.c 里解掉存档段的 #if 0。 */
-/* ADAU145x 的 I2C 从机地址范围：0x38~0x3B
- *   地址由 SS/ADDR0 与 MOSI/ADDR1 引脚硬接线决定，两脚内部 250 kΩ 上拉，
- *   因此悬空 = 0x3B（最常用），任一脚下拉则变成 0x3A/0x39/0x38 */
-#define USBI_I2C_ADDR_MIN 0x38u
-#define USBI_I2C_ADDR_MAX 0x3Bu
+/* ==================== I2C 引脚（硬件 I2C1） ==================== */
+/* 用硬件 I2C1 + HAL：正版 USBi 的 DSP 侧 I2C 固定 400 kHz，外设能跑满标称速率，
+ * 抖动也比软件模拟小。
+ *
+ * ⚠ 但 HAL 的每个等待都是 `while (!flag) { if (HAL_GetTick()-t0 > Timeout) 报错; }`，
+ *   而 vendor 请求全在 USB 中断里执行 —— 如果 SysTick 的优先级低于 USB 中断，
+ *   中断期间 uwTick 不前进，超时判断永远为假，总线一被拉死就会永久卡住。
+ *   所以本工程把 SysTick 抬到最高优先级、USB 中断降到 1（见 py32f071_hal_conf.h
+ *   的 TICK_INT_PRIORITY 与 Core/SRC/usb.c 的 HAL_NVIC_SetPriority(USB_IRQn,1,0)）。
+ *
+ * 引脚可换：USBI_I2C_ON_SPI_PINS = 1 时改用 SPI 那组线（PA5=SCL、PA7=SDA）。
+ * 真 USBi 的排针上 ADAU 的 I2C 与被控 SPI 是同一组物理线
+ * （SCL/CCLK、SDA/MOSI、SS/ADDR0），按真 USBi 10 针口引出的板子必须置 1。 */
+#ifndef USBI_I2C_ON_SPI_PINS
+#define USBI_I2C_ON_SPI_PINS 0
+#endif
 
-/* 上电探测：每个地址试几次、每次等多少毫秒 */
-#define USBI_I2C_PROBE_TRIALS     2u
-#define USBI_I2C_PROBE_TIMEOUT_MS 20u
+#if USBI_I2C_ON_SPI_PINS
+#define USBI_I2C_SCL_PORT GPIOA
+#define USBI_I2C_SCL_PIN  GPIO_PIN_5
+#define USBI_I2C_SDA_PORT GPIOA
+#define USBI_I2C_SDA_PIN  GPIO_PIN_7
+#else
+/* 与本工程 Core/SRC/i2c.c 里 mcustudio 配的 I2C1 引脚一致（AF6、开漏） */
+#define USBI_I2C_SCL_PORT GPIOA
+#define USBI_I2C_SCL_PIN  GPIO_PIN_9
+#define USBI_I2C_SDA_PORT GPIOA
+#define USBI_I2C_SDA_PIN  GPIO_PIN_10
+#endif
 
-/* 单次 I2C 事务的数据字节上限（参考 adau1452-esp32-controller 的实测值）：
+/* SCL 时钟频率。正版 USBi 固定 400 kHz，这里默认跟它一致。
+ * ⚠ 400 kHz 需要板上 2 kΩ 上拉；如果只有 MCU 内部上拉（约 30~50 kΩ），
+ *   上升沿跟不上，读回会变成 0xFF —— 那就先降到 100000 甚至 20000 排查。 */
+#ifndef USBI_I2C_CLOCK_HZ
+#define USBI_I2C_CLOCK_HZ 400000u
+#endif
+
+/* 单次等待（START / ADDR / TXE / BTF / 停止）的超时，单位 ms。
+ * 248 字节一帧在 400 kHz 下约 5.6 ms，50 ms 够用；卡死时最多阻塞这么久。 */
+#ifndef USBI_I2C_TIMEOUT_MS
+#define USBI_I2C_TIMEOUT_MS 50u
+#endif
+
+/* 单次 I2C 事务（一个 START…STOP）允许的数据字节上限。
+ * 数值取自 adau1452-esp32-controller 的实测值（它跑通过 1452 的完整下载）：
  *   - 核心寄存器区（>= 0xF000）：按字节寻址，一次 ≤ 24 字节
- *   - 程序内存区（>= 0xC000）：一次只写一个 32 位字
+ *   - 程序内存区（0xC000~0xEFFF）：快路径 248 字节／保守路径一个 32 位字
  *   - 参数/DM 区：一次 ≤ 28 字节（保持 4 字节对齐）
- * 读方向放宽一些（减少事务数，避免主机侧超时） */
+ *   - 读方向放宽（减少事务数；240 是参考工程的实测上限） */
 #define USBI_I2C_CHUNK_REG      24u
 #define USBI_I2C_CHUNK_PARAM    28u
-#define USBI_I2C_CHUNK_PROG     4u
-#define USBI_I2C_CHUNK_READ_RAM 96u
+#define USBI_I2C_CHUNK_READ_REG 24u
+#define USBI_I2C_CHUNK_READ_RAM 240u
 
-/* 程序内存区每个 32 位字之间的间隔。
- * 手册说批量下载不需要逐字延时（先 HIBERNATE 停核再块写即可），但
+/* 程序内存区走"快路径"（一次 248 字节）还是"保守路径"（一次一个 32 位字）。
+ * 保守路径每写 4 字节就要 300 µs 间隔，12 KB 要 1.7 s、还把 USB 中断占住
+ * 好几十毫秒；快路径把整段写完之后只等一次 300 µs settle，快 5 倍以上。 */
+#ifndef USBI_I2C_FAST_PROG
+#define USBI_I2C_FAST_PROG 1
+#endif
+
+#if USBI_I2C_FAST_PROG
+#define USBI_I2C_CHUNK_PROG 248u
+#else
+#define USBI_I2C_CHUNK_PROG 4u
+#endif
+
+/* 单次事务失败后的重试次数（每次重试前先做总线恢复） */
+#ifndef USBI_I2C_RETRIES
+#define USBI_I2C_RETRIES 3u
+#endif
+
+/* ADAU145x 的 I2C 从机地址范围：0x38~0x3B
+ *   地址由 SS/ADDR0 与 MOSI/ADDR1 引脚硬接线决定，两脚内部 250 kΩ 上拉，
+ *   因此悬空 = 0x3B（最常用，参考工程也是 0x3B），任一脚下拉则变成 0x3A/0x39/0x38 */
+#define USBI_I2C_ADDR_MIN     0x38u
+#define USBI_I2C_ADDR_MAX     0x3Bu
+#define USBI_I2C_ADDR_DEFAULT USBI_I2C_ADDR_MAX
+
+/* 上电探测：每个地址试几次 */
+#define USBI_I2C_PROBE_TRIALS 2u
+
+/* 程序内存区每写完一块之后的等待。
+ * 手册说批量下载不需要延长间隔（先 HIBERNATE 停核再块写即可），但
  * adau1452-esp32-controller 实测未加延时会"有 ACK 但指令没进 DSP → 无声"，
  * 这里默认沿用它的 300 µs；确认不需要可以改成 0 关掉 */
 #ifndef USBI_I2C_PROG_WORD_DELAY_US

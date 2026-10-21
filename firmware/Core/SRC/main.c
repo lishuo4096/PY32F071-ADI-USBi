@@ -96,6 +96,7 @@ int main(void)
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
   /* USER CODE BEGIN Init */
+  HAL_Delay(20);//等待上电稳定
 
   /* USER CODE END Init */
 

@@ -1,0 +1,13 @@
+# 构建产物（EIDE / arm-none-eabi-gcc）
+firmware/EIDE/build/
+firmware/EIDE/_objcheck/
+*.map
+*.elf
+*.o
+*.d
+*.su
+
+# 系统 / 编辑器
+Thumbs.db
+desktop.ini
+.DS_Store

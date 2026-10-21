@@ -39,7 +39,11 @@ void Studio_USB_Init(void)
 
     usbi_usb_init();
 
-    HAL_NVIC_SetPriority(USB_IRQn, 0, 0);
+    /* ★ 优先级 1（原为 0）：必须低于 SysTick（TICK_INT_PRIORITY = PRIORITY_HIGHEST）。
+     * vendor 请求在 USB 中断里同步执行 I2C 事务，HAL 的超时全靠 HAL_GetTick()；
+     * 只有 SysTick 能抢占本中断，uwTick 才会前进，超时判断才成立。
+     * 代价是每毫秒被打断一次（HAL_IncTick 几十个周期），可忽略。 */
+    HAL_NVIC_SetPriority(USB_IRQn, 1, 0);
     HAL_NVIC_EnableIRQ(USB_IRQn);
 }
 

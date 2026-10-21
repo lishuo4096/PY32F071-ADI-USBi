@@ -123,7 +123,12 @@ extern "C" {
 #define  PRIORITY_HIGH           1
 #define  PRIORITY_LOW            2
 #define  PRIORITY_LOWEST         3
-#define  TICK_INT_PRIORITY       ((uint32_t)PRIORITY_LOWEST)    /*!< tick interrupt priority (lowest by default)  */
+/* ★ 改成 PRIORITY_HIGHEST（原值 PRIORITY_LOWEST）：
+ * vendor 请求都在 USB 中断里跑，而 HAL 的超时全部基于 HAL_GetTick()。
+ * SysTick 优先级低于 USB 中断时，中断期间 uwTick 不前进 → HAL 里
+ * "超时就报错"的判断永远不成立 → I2C 总线一被拉死就永久卡在中断里。
+ * 抬到最高、USB 降到 PRIORITY_HIGH（见 Core/SRC/usb.c），HAL 的超时才真生效。 */
+#define  TICK_INT_PRIORITY       ((uint32_t)PRIORITY_HIGHEST)   /*!< tick interrupt priority */
 #define  USE_RTOS                0
 #define  PREFETCH_ENABLE         0
 

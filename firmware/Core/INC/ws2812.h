@@ -11,7 +11,12 @@
   *            - 帧尾补足低电平当 reset（WS2812 要求 > 50 µs）
   *
   *          时序换算（PY32F071 @48 MHz、TIM17 ARR=59 → 60 计数 = 1.25 µs）：
-  *              T0H = 17 计数 ≈ 0.354 µs、T1H = 38 计数 ≈ 0.792 µs
+  *              T0H = 17 计数 ≈ 0.354 µs、T0L = 43 计数 ≈ 0.896 µs
+  *              T1H = 38 计数 ≈ 0.792 µs、T1L = 22 计数 ≈ 0.458 µs
+  *          四项都落在 WS2812B 的规格窗内（T0H 250~550、T1H 650~950、
+  *          T0L 700~1000、T1L 300~600 ns），别再随手改小 T1L —— T1L 是四项里
+  *          余量最小的一个，它不够时"1 后面跟 0"会被灯珠当成一个位，
+  *          整帧错位一位，表现为亮度峰值处闪一下橙色。
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -39,7 +44,9 @@ extern "C" {
 #define WS2812_T0H_CCR     17u
 #define WS2812_T1H_CCR     38u
 
-/* 帧尾低电平槽位数：60 × 1.25 µs = 75 µs > 50 µs */
+/* 帧尾低电平槽位数：60 × 1.25 µs = 75 µs > 50 µs
+ * （最后一槽会被 TC 回调截断，实际约 59 槽 ≈ 74 µs，见 ws2812.c）
+ * 想给 WS2812B-V5 这种要求 280 µs 复位的型号留余量，把这个值改到 240 以上。 */
 #define WS2812_RESET_SLOTS 60u
 
 /* 数据脚：PB9 = TIM17_CH1（tim.c 的 MspInit 里已配成 AF2） */
@@ -67,7 +74,11 @@ typedef struct {
 /* Exported functions --------------------------------------------------------*/
 void    ws2812_init(void);
 uint8_t ws2812_busy(void);
-void    ws2812_show(void);
+/**
+  * @brief  把 ws2812_set_all()/fill() 设好的颜色发出去（非阻塞）
+  * @retval 1 = 这一帧已启动；0 = 上一帧还没发完（丢帧）或启动失败
+  */
+uint8_t ws2812_show(void);
 void    ws2812_set_all(uint8_t r, uint8_t g, uint8_t b);
 void    ws2812_set_pixel(uint16_t index, uint8_t r, uint8_t g, uint8_t b);
 void    ws2812_fill(uint8_t r, uint8_t g, uint8_t b);
