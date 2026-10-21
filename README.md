@@ -154,6 +154,8 @@ I²C 后端的分块与延时取参考工程 `adau1452-esp32-controller` 的实�
 
 不想折腾编译环境的，直接烧这些文件。
 
+📦 **也可以在 [Releases](https://github.com/lishuo4096/PY32F071-ADI-USBi/releases) 页面直接下载**（`v1.2.0` 已附三种模式的 hex / bin 与校验和），不用 clone 整个仓库。
+
 **v1.2.0 —— 三种 LED 模式各一份**（总线为默认 SPI，芯片 PY32F071K1BU6）：
 
 | 文件 | LED 模式 | Flash 占用 | 说明 |
@@ -355,6 +357,8 @@ Three things you must know:
 3. **SysTick must have the highest priority**: vendor requests run inside the USB interrupt, and HAL's I²C timeouts are based on `HAL_GetTick()`. If SysTick has a lower priority than USB, `uwTick` freezes inside the ISR, the timeout never fires, and a stuck bus hangs the interrupt forever (only the 2 s watchdog recovers). This project sets `TICK_INT_PRIORITY = PRIORITY_HIGHEST` and `USB_IRQn` priority = `1`; both are commented — **do not revert them**.
 
 ### Prebuilt firmware
+
+📦 **Or grab them from the [Releases](https://github.com/lishuo4096/PY32F071-ADI-USBi/releases) page** — `v1.2.0` ships all three modes as hex / bin plus checksums, no clone needed.
 
 **v1.2.0 — one build per LED mode** (SPI bus, PY32F071K1BU6):
 
